@@ -1,3 +1,145 @@
-<Solution>
-  <Project Path="CalorieTracker.csproj" />
-</Solution>
+using System.Data;
+using Npgsql;
+
+namespace CalorieTracker;
+
+/// <summary>Работа с PostgreSQL. ВСЕ запросы параметризованные (защита от SQL-инъекций).</summary>
+public static class Db
+{
+    // >>> ВПИШИТЕ СВОЙ ПАРОЛЬ от PostgreSQL вместо ВАШ_ПАРОЛЬ <<<
+    public const string ConnString =
+        "Host=localhost;Port=5432;Database=PraktikaKutluguzhin;Username=Denis1;Password=0908070605";
+
+    static NpgsqlCommand Make(NpgsqlConnection c, string sql, (string, object?)[] p)
+    {
+        var cmd = new NpgsqlCommand(sql, c);
+        foreach (var (n, v) in p) cmd.Parameters.AddWithValue(n, v ?? DBNull.Value);
+        return cmd;
+    }
+
+    public static DataTable Query(string sql, params (string, object?)[] p)
+    {
+        using var c = new NpgsqlConnection(ConnString);
+        using var cmd = Make(c, sql, p);
+        var dt = new DataTable();
+        new NpgsqlDataAdapter(cmd).Fill(dt);
+        return dt;
+    }
+
+    public static int Exec(string sql, params (string, object?)[] p)
+    {
+        using var c = new NpgsqlConnection(ConnString);
+        c.Open();
+        using var cmd = Make(c, sql, p);
+        return cmd.ExecuteNonQuery();
+    }
+
+    public static object? Scalar(string sql, params (string, object?)[] p)
+    {
+        using var c = new NpgsqlConnection(ConnString);
+        c.Open();
+        using var cmd = Make(c, sql, p);
+        var r = cmd.ExecuteScalar();
+        return r == DBNull.Value ? null : r;
+    }
+
+    /// <summary>Несколько команд в одной транзакции (всё или ничего).</summary>
+    public static void ExecTx(params (string Sql, (string, object?)[] Params)[] cmds)
+    {
+        using var c = new NpgsqlConnection(ConnString);
+        c.Open();
+        using var tx = c.BeginTransaction();
+        foreach (var (sql, ps) in cmds)
+        {
+            using var cmd = Make(c, sql, ps);
+            cmd.Transaction = tx;
+            cmd.ExecuteNonQuery();
+        }
+        tx.Commit();
+    }
+}
+
+/// <summary>Текущий вошедший пользователь.</summary>
+public static class Session
+{
+    public static int UserId;
+    public static string Login = "";
+    public static string FullName = "";
+    public static string Role = "";
+
+    public static bool IsAdmin =>
+        Role.Contains("админ", StringComparison.OrdinalIgnoreCase) || Role.Contains("admin", StringComparison.OrdinalIgnoreCase);
+
+    public static bool IsManager =>
+        Role.Contains("менедж", StringComparison.OrdinalIgnoreCase) || Role.Contains("manager", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Администратор или менеджер.</summary>
+    public static bool IsStaff => IsAdmin || IsManager;
+}
+
+/// <summary>Сообщения пользователю и понятные тексты ошибок.</summary>
+public static class Msg
+{
+    public static void Info(string t) => MessageBox.Show(t, "Информация", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    public static void Warn(string t) => MessageBox.Show(t, "Внимание", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+    public static void Error(string t) => MessageBox.Show(t, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+    public static bool Confirm(string t) =>
+        MessageBox.Show(t, "Подтверждение", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes;
+
+    public static string Friendly(Exception ex) => ex switch
+    {
+        PostgresException pe => pe.SqlState switch
+        {
+            "23505" => "Такая запись уже существует (повторяется логин, email, название или дата).",
+            "23503" => "Действие невозможно: запись связана с другими данными (например, продукт уже используется в дневнике).",
+            "23502" => "Не заполнено обязательное поле.",
+            "23514" => "Значение выходит за допустимые пределы. Проверьте калорийность и БЖУ (сумма белков, жиров и углеводов не больше 100 г на 100 г продукта).",
+            "22001" => "Введено слишком длинное значение.",
+            "22003" => "Число слишком большое.",
+            _ => "Ошибка базы данных: " + pe.MessageText
+        },
+        NpgsqlException => "Не удалось подключиться к базе данных. Проверьте, что PostgreSQL запущен и пароль в файле Db.cs указан верно.",
+        _ => "Ошибка: " + ex.Message
+    };
+
+    /// <summary>Выполнить действие; при ошибке показать понятное сообщение.</summary>
+    public static bool Try(Action a)
+    {
+        try { a(); return true; }
+        catch (Exception ex) { Error(Friendly(ex)); return false; }
+    }
+}
+
+/// <summary>Поиск id справочных значений (статусы продуктов, роль «Пользователь»).</summary>
+public static class Lookup
+{
+    static int? _pending, _approved, _rejected, _userRole;
+
+    public static int Pending => _pending ??= FindStatus(new[] { "провер", "pend", "ожид" }, 0);
+    public static int Approved => _approved ??= FindStatus(new[] { "одобр", "approv", "утверж" }, 1);
+
+    public static int Rejected => _rejected ??= FindStatus(new[] { "отклон", "reject" }, 2);
+    public static int UserRole => _userRole ??= FindRole();
+
+    static int FindStatus(string[] patterns, int fallbackIndex)
+    {
+        var dt = Db.Query("SELECT status_id, status_name FROM product_statuses ORDER BY status_id");
+        foreach (DataRow r in dt.Rows)
+        {
+            var n = ((string)r["status_name"]).ToLowerInvariant();
+            if (patterns.Any(p => n.Contains(p))) return (int)r["status_id"];
+        }
+        return (int)dt.Rows[Math.Min(fallbackIndex, dt.Rows.Count - 1)]["status_id"];
+    }
+
+    static int FindRole()
+    {
+        var dt = Db.Query("SELECT role_id, role_name FROM roles ORDER BY role_id");
+        foreach (DataRow r in dt.Rows)
+        {
+            var n = ((string)r["role_name"]).ToLowerInvariant();
+            if (n.Contains("польз") || n.Contains("user")) return (int)r["role_id"];
+        }
+        return (int)dt.Rows[dt.Rows.Count - 1]["role_id"];
+    }
+}
